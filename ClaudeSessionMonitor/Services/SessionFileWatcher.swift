@@ -110,6 +110,196 @@ class SessionFileWatcher: ObservableObject {
     }
 }
 
+// MARK: - Recent Sessions Watcher
+@MainActor
+class RecentSessionsWatcher: ObservableObject {
+    private var sources: [DispatchSourceFileSystemObject] = []
+    private var fileDescriptors: [Int32] = []
+    private let parser = SessionParser()
+
+    @Published var sessions: [Session] = []
+
+    private var initialSessionIds: Set<UUID> = []
+    private var hasInitialized = false
+
+    func startWatching() {
+        stopWatching()
+        loadRecentSessions()
+        startAllProjectsMonitoring()
+    }
+
+    func stopWatching() {
+        for source in sources {
+            source.cancel()
+        }
+        sources.removeAll()
+
+        for fd in fileDescriptors {
+            if fd >= 0 {
+                close(fd)
+            }
+        }
+        fileDescriptors.removeAll()
+    }
+
+    private func loadRecentSessions() {
+        let projectsPath = Constants.claudeProjectsPath
+
+        guard FileManager.default.fileExists(atPath: projectsPath.path) else {
+            sessions = []
+            return
+        }
+
+        do {
+            let projectDirs = try FileManager.default.contentsOfDirectory(
+                at: projectsPath,
+                includingPropertiesForKeys: [.isDirectoryKey],
+                options: [.skipsHiddenFiles]
+            ).filter { url in
+                var isDirectory: ObjCBool = false
+                FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory)
+                return isDirectory.boolValue
+            }
+
+            var allSessions: [Session] = []
+
+            for projectDir in projectDirs {
+                let projectId = projectDir.lastPathComponent
+                let jsonlFiles = try FileManager.default.contentsOfDirectory(
+                    at: projectDir,
+                    includingPropertiesForKeys: [.contentModificationDateKey],
+                    options: [.skipsHiddenFiles]
+                ).filter { $0.pathExtension == "jsonl" }
+
+                for file in jsonlFiles {
+                    var session = Session(filePath: file, projectId: projectId)
+                    if let summary = loadSessionSummary(from: file) {
+                        session.summary = summary
+                    }
+                    allSessions.append(session)
+                }
+            }
+
+            // Sort by last modified and take top 10
+            let sortedSessions = allSessions.sorted { $0.lastModified > $1.lastModified }
+            let topSessions = Array(sortedSessions.prefix(10))
+
+            if !hasInitialized {
+                // First load: store initial session IDs
+                initialSessionIds = Set(topSessions.map { $0.id })
+                hasInitialized = true
+                sessions = topSessions
+            } else {
+                // Subsequent updates: merge with existing sessions
+                // New sessions go to top, existing ones stay in their positions
+                let existingIds = Set(sessions.map { $0.id })
+                let newSessions = sortedSessions.filter { !existingIds.contains($0.id) }
+
+                if !newSessions.isEmpty {
+                    // Insert new sessions at the top
+                    sessions = newSessions + sessions
+                }
+
+                // Update modification times for existing sessions
+                for (index, existingSession) in sessions.enumerated() {
+                    if let updated = sortedSessions.first(where: { $0.id == existingSession.id }) {
+                        sessions[index].lastModified = updated.lastModified
+                        sessions[index].summary = updated.summary
+                    }
+                }
+            }
+
+        } catch {
+            print("Error loading recent sessions: \(error)")
+        }
+    }
+
+    private func loadSessionSummary(from url: URL) -> String? {
+        guard let handle = FileHandle(forReadingAtPath: url.path) else { return nil }
+        defer { try? handle.close() }
+
+        let data = handle.readData(ofLength: 4096)
+        guard let content = String(data: data, encoding: .utf8) else { return nil }
+
+        let lines = content.components(separatedBy: .newlines)
+
+        for line in lines.prefix(10) {
+            guard let data = line.data(using: .utf8),
+                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let type = json["type"] as? String,
+                  type == "summary",
+                  let summary = json["summary"] as? String else {
+                continue
+            }
+            return summary
+        }
+
+        return nil
+    }
+
+    private func startAllProjectsMonitoring() {
+        let projectsPath = Constants.claudeProjectsPath
+
+        guard FileManager.default.fileExists(atPath: projectsPath.path) else { return }
+
+        do {
+            let projectDirs = try FileManager.default.contentsOfDirectory(
+                at: projectsPath,
+                includingPropertiesForKeys: [.isDirectoryKey],
+                options: [.skipsHiddenFiles]
+            ).filter { url in
+                var isDirectory: ObjCBool = false
+                FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory)
+                return isDirectory.boolValue
+            }
+
+            for projectDir in projectDirs {
+                startDirectoryMonitor(at: projectDir)
+            }
+
+            // Also watch the main projects directory for new projects
+            startDirectoryMonitor(at: projectsPath)
+
+        } catch {
+            print("Error setting up project monitoring: \(error)")
+        }
+    }
+
+    private func startDirectoryMonitor(at url: URL) {
+        let fd = open(url.path, O_EVTONLY)
+        guard fd >= 0 else { return }
+
+        fileDescriptors.append(fd)
+
+        let queue = DispatchQueue(label: "com.claudesessionmonitor.recentwatcher.\(url.lastPathComponent)")
+
+        let source = DispatchSource.makeFileSystemObjectSource(
+            fileDescriptor: fd,
+            eventMask: [.write, .link],
+            queue: queue
+        )
+
+        source.setEventHandler { [weak self] in
+            Task { @MainActor [weak self] in
+                self?.loadRecentSessions()
+            }
+        }
+
+        source.setCancelHandler {
+            close(fd)
+        }
+
+        source.resume()
+        sources.append(source)
+    }
+
+    func reset() {
+        hasInitialized = false
+        initialSessionIds.removeAll()
+        sessions.removeAll()
+    }
+}
+
 // MARK: - Project Directory Watcher
 @MainActor
 class ProjectDirectoryWatcher: ObservableObject {

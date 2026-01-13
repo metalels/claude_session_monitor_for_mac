@@ -306,8 +306,6 @@ struct MessageTableView: View {
     let showRoleColumn: Bool
     let autoScroll: Bool
 
-    @State private var scrollProxy: ScrollViewProxy?
-
     var body: some View {
         ScrollViewReader { proxy in
             List(messages) { message in
@@ -322,18 +320,25 @@ struct MessageTableView: View {
             }
             .listStyle(.plain)
             .onAppear {
-                scrollProxy = proxy
                 // Scroll to last message when session is opened
                 if let lastMessage = messages.last {
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
-                        proxy.scrollTo(lastMessage.id, anchor: .bottom)
+                    // Multiple delayed scrolls to handle dynamic content rendering
+                    for delay in [0.1, 0.3, 0.5] {
+                        DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
+                            proxy.scrollTo(lastMessage.id, anchor: .bottom)
+                        }
                     }
                 }
             }
             .onChange(of: messages.count) { _, _ in
                 if autoScroll, let lastMessage = messages.last {
-                    withAnimation(.easeOut(duration: 0.2)) {
-                        proxy.scrollTo(lastMessage.id, anchor: .bottom)
+                    // Multiple delayed scrolls to handle dynamic content height
+                    for delay in [0.05, 0.2, 0.4] {
+                        DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
+                            withAnimation(.easeOut(duration: 0.15)) {
+                                proxy.scrollTo(lastMessage.id, anchor: .bottom)
+                            }
+                        }
                     }
                 }
             }
@@ -927,8 +932,8 @@ struct ToolUseBlockView: View {
     @State private var isInputExpanded = false
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            // Tool header
+        VStack(alignment: .leading, spacing: isInputExpanded ? 8 : 6) {
+            // Tool header - entire row is tappable
             HStack {
                 Image(systemName: "terminal.fill")
                     .foregroundColor(.orange)
@@ -938,16 +943,22 @@ struct ToolUseBlockView: View {
 
                 Spacer()
 
-                Button(action: { isInputExpanded.toggle() }) {
-                    Image(systemName: isInputExpanded ? "chevron.up" : "chevron.down")
-                        .foregroundColor(.secondary)
+                Image(systemName: isInputExpanded ? "chevron.up" : "chevron.down")
+                    .foregroundColor(.secondary)
+                    .font(.system(size: 14, weight: .medium))
+            }
+            .padding(.vertical, 4)
+            .contentShape(Rectangle())
+            .onTapGesture {
+                withAnimation(.easeInOut(duration: 0.2)) {
+                    isInputExpanded.toggle()
                 }
-                .buttonStyle(.plain)
             }
 
             // Tool input (parsed nicely)
             if isInputExpanded, let input = block.toolInput {
                 ToolInputView(toolName: block.toolName ?? "", input: input)
+                    .transition(.opacity.combined(with: .move(edge: .top)))
             } else if let input = block.toolInput {
                 // Preview of input
                 Text(input.prefix(100) + (input.count > 100 ? "..." : ""))
@@ -1113,7 +1124,8 @@ struct ThinkingBlockView: View {
     @State private var isExpanded = false
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
+        VStack(alignment: .leading, spacing: isExpanded ? 8 : 0) {
+            // Header - entire row is tappable
             HStack {
                 Image(systemName: "brain.head.profile")
                     .foregroundColor(.purple)
@@ -1123,19 +1135,26 @@ struct ThinkingBlockView: View {
 
                 Spacer()
 
-                Button(action: { isExpanded.toggle() }) {
-                    Image(systemName: isExpanded ? "chevron.up" : "chevron.down")
-                        .foregroundColor(.secondary)
+                Image(systemName: isExpanded ? "chevron.up" : "chevron.down")
+                    .foregroundColor(.secondary)
+                    .font(.system(size: 14, weight: .medium))
+            }
+            .padding(.vertical, 4)
+            .contentShape(Rectangle())
+            .onTapGesture {
+                withAnimation(.easeInOut(duration: 0.2)) {
+                    isExpanded.toggle()
                 }
-                .buttonStyle(.plain)
             }
 
+            // Content
             if isExpanded, let thinking = block.thinking {
                 Text(thinking)
                     .font(.system(.caption))
                     .foregroundColor(.secondary)
                     .textSelection(.enabled)
                     .fixedSize(horizontal: false, vertical: true)
+                    .transition(.opacity.combined(with: .move(edge: .top)))
             }
         }
         .padding(10)

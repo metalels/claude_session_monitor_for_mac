@@ -13,13 +13,39 @@ struct ProjectListView: View {
         return projects.filter { $0.displayName.localizedCaseInsensitiveContains(searchText) }
     }
 
+    private var isRecentSelected: Bool {
+        selectedProject?.isRecentSection == true
+    }
+
     var body: some View {
         VStack(spacing: 0) {
-            // Header
-            HStack {
+            // Header with Recent 10 button
+            HStack(spacing: 8) {
                 Text("Projects")
                     .font(.headline)
+
+                // Recent 10 button
+                Button(action: {
+                    selectedProject = Project.recentSection
+                }) {
+                    HStack(spacing: 4) {
+                        Image(systemName: "clock.arrow.circlepath")
+                            .font(.system(size: 10))
+                        Text("Recent 10")
+                            .font(.system(size: 11, weight: .medium))
+                    }
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 4)
+                    .background(
+                        RoundedRectangle(cornerRadius: 4)
+                            .fill(isRecentSelected ? Color.orange : Color.orange.opacity(0.2))
+                    )
+                    .foregroundColor(isRecentSelected ? .white : .orange)
+                }
+                .buttonStyle(.plain)
+
                 Spacer()
+
                 Text("\(projects.count)")
                     .font(.caption)
                     .foregroundColor(.secondary)

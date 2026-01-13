@@ -5,8 +5,27 @@ struct Project: Identifiable, Hashable {
     let path: URL
     let displayName: String
     let actualPath: String?
+    let isRecentSection: Bool
+
+    /// Special "Recent" section project
+    static let recentSection = Project(
+        id: "__recent__",
+        path: URL(fileURLWithPath: "/"),
+        displayName: "Recent 10 updates",
+        actualPath: nil,
+        isRecentSection: true
+    )
+
+    private init(id: String, path: URL, displayName: String, actualPath: String?, isRecentSection: Bool) {
+        self.id = id
+        self.path = path
+        self.displayName = displayName
+        self.actualPath = actualPath
+        self.isRecentSection = isRecentSection
+    }
 
     init(directoryURL: URL) {
+        self.isRecentSection = false
         self.id = directoryURL.lastPathComponent
         self.path = directoryURL
 

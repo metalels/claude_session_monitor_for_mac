@@ -3,6 +3,7 @@ import SwiftUI
 struct ContentView: View {
     @StateObject private var projectWatcher = ProjectDirectoryWatcher()
     @StateObject private var sessionWatcher = SessionDirectoryWatcher()
+    @StateObject private var recentSessionsWatcher = RecentSessionsWatcher()
     @StateObject private var fileWatcher = SessionFileWatcher()
 
     @State private var selectedProject: Project?
@@ -16,6 +17,14 @@ struct ContentView: View {
     @AppStorage("showEmptyMessages") private var showEmptyMessages = false
     @AppStorage("rememberLastProject") private var rememberLastProject = true
     @AppStorage("lastProjectId") private var lastProjectId = ""
+
+    /// Returns sessions based on whether Recent section is selected
+    private var currentSessions: [Session] {
+        if selectedProject?.isRecentSection == true {
+            return recentSessionsWatcher.sessions
+        }
+        return sessionWatcher.sessions
+    }
 
     var body: some View {
         NavigationSplitView(
@@ -34,7 +43,7 @@ struct ContentView: View {
         } content: {
             // Middle: Session list (1.5 ratio)
             SessionListView(
-                sessions: sessionWatcher.sessions,
+                sessions: currentSessions,
                 selectedSession: $selectedSession
             )
             .navigationSplitViewColumnWidth(
@@ -84,19 +93,29 @@ struct ContentView: View {
         }
         .onAppear {
             projectWatcher.startWatching()
+            recentSessionsWatcher.startWatching()
         }
         .onChange(of: projectWatcher.projects) { _, projects in
             // Restore last project when projects are loaded
             if rememberLastProject && selectedProject == nil && !lastProjectId.isEmpty {
-                if let project = projects.first(where: { $0.id == lastProjectId }) {
+                if lastProjectId == Project.recentSection.id {
+                    selectedProject = Project.recentSection
+                } else if let project = projects.first(where: { $0.id == lastProjectId }) {
                     selectedProject = project
                 }
             }
         }
         .onChange(of: selectedProject) { _, newProject in
+            selectedSession = nil
+
             if let project = newProject {
-                sessionWatcher.startWatching(project: project)
-                selectedSession = nil
+                if project.isRecentSection {
+                    // Recent section selected - sessions come from recentSessionsWatcher
+                    sessionWatcher.stopWatching()
+                } else {
+                    // Regular project selected
+                    sessionWatcher.startWatching(project: project)
+                }
 
                 // Save last project
                 if rememberLastProject {
