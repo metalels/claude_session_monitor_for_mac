@@ -19,9 +19,19 @@ struct ContentView: View {
     @AppStorage("lastProjectId") private var lastProjectId = ""
 
     /// Returns sessions based on whether Recent section is selected
+    /// For Recent section: current selected session + recent 10 = max 11 sessions
     private var currentSessions: [Session] {
         if selectedProject?.isRecentSection == true {
-            return recentSessionsWatcher.sessions
+            let recentSessions = recentSessionsWatcher.sessions
+
+            // If a session is selected and not in recent 10, add it at the top
+            if let selected = selectedSession,
+               !recentSessions.contains(where: { $0.id == selected.id }) {
+                // Ensure max 11 sessions (selected + recent 10)
+                return Array(([selected] + recentSessions).prefix(11))
+            }
+
+            return recentSessions
         }
         return sessionWatcher.sessions
     }

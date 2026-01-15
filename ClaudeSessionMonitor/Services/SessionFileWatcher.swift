@@ -114,40 +114,60 @@ class SessionFileWatcher: ObservableObject {
 @MainActor
 class RecentSessionsWatcher: ObservableObject {
     private var sources: [DispatchSourceFileSystemObject] = []
-    private var fileDescriptors: [Int32] = []
     private let parser = SessionParser()
+    private var reloadTask: Task<Void, Never>?
 
     @Published var sessions: [Session] = []
 
-    private var initialSessionIds: Set<UUID> = []
-    private var hasInitialized = false
-
     func startWatching() {
         stopWatching()
-        loadRecentSessions()
+        triggerReload()
         startAllProjectsMonitoring()
     }
 
     func stopWatching() {
+        reloadTask?.cancel()
+        reloadTask = nil
+
         for source in sources {
             source.cancel()
         }
         sources.removeAll()
-
-        for fd in fileDescriptors {
-            if fd >= 0 {
-                close(fd)
-            }
-        }
-        fileDescriptors.removeAll()
+        // Note: FDs are closed by setCancelHandler, no manual close needed
     }
 
-    private func loadRecentSessions() {
+    /// Triggers background reload of recent sessions with debounce
+    /// Cancels any pending reload and starts a new one after 0.5 second delay
+    private func triggerReload() {
+        reloadTask?.cancel()
+        reloadTask = Task { [weak self] in
+            // Debounce: wait 0.5 seconds before loading
+            try? await Task.sleep(nanoseconds: 500_000_000)
+            guard !Task.isCancelled else { return }
+
+            // Run I/O in background
+            let loadedSessions = await Task.detached {
+                await Self.loadRecentSessionsInBackground()
+            }.value
+
+            guard !Task.isCancelled else { return }
+            // Already on MainActor since this Task inherits actor context
+            self?.updateSessions(loadedSessions)
+        }
+    }
+
+    @MainActor
+    private func updateSessions(_ newSessions: [Session]) {
+        sessions = newSessions
+    }
+
+    /// Loads recent sessions in background thread (non-blocking)
+    /// First collects all session metadata, sorts by date, then loads summaries for top 10 only
+    private static func loadRecentSessionsInBackground() async -> [Session] {
         let projectsPath = Constants.claudeProjectsPath
 
         guard FileManager.default.fileExists(atPath: projectsPath.path) else {
-            sessions = []
-            return
+            return []
         }
 
         do {
@@ -161,6 +181,7 @@ class RecentSessionsWatcher: ObservableObject {
                 return isDirectory.boolValue
             }
 
+            // First pass: collect all sessions without loading summaries
             var allSessions: [Session] = []
 
             for projectDir in projectDirs {
@@ -172,49 +193,32 @@ class RecentSessionsWatcher: ObservableObject {
                 ).filter { $0.pathExtension == "jsonl" }
 
                 for file in jsonlFiles {
-                    var session = Session(filePath: file, projectId: projectId)
-                    if let summary = loadSessionSummary(from: file) {
-                        session.summary = summary
-                    }
+                    let session = Session(filePath: file, projectId: projectId)
                     allSessions.append(session)
                 }
             }
 
             // Sort by last modified and take top 10
             let sortedSessions = allSessions.sorted { $0.lastModified > $1.lastModified }
-            let topSessions = Array(sortedSessions.prefix(10))
+            var topSessions = Array(sortedSessions.prefix(10))
 
-            if !hasInitialized {
-                // First load: store initial session IDs
-                initialSessionIds = Set(topSessions.map { $0.id })
-                hasInitialized = true
-                sessions = topSessions
-            } else {
-                // Subsequent updates: merge with existing sessions
-                // New sessions go to top, existing ones stay in their positions
-                let existingIds = Set(sessions.map { $0.id })
-                let newSessions = sortedSessions.filter { !existingIds.contains($0.id) }
-
-                if !newSessions.isEmpty {
-                    // Insert new sessions at the top
-                    sessions = newSessions + sessions
-                }
-
-                // Update modification times for existing sessions
-                for (index, existingSession) in sessions.enumerated() {
-                    if let updated = sortedSessions.first(where: { $0.id == existingSession.id }) {
-                        sessions[index].lastModified = updated.lastModified
-                        sessions[index].summary = updated.summary
-                    }
+            // Second pass: load summaries only for top 10 sessions
+            for index in topSessions.indices {
+                if let summary = loadSessionSummary(from: topSessions[index].filePath) {
+                    topSessions[index].summary = summary
                 }
             }
 
+            return topSessions
+
         } catch {
             print("Error loading recent sessions: \(error)")
+            return []
         }
     }
 
-    private func loadSessionSummary(from url: URL) -> String? {
+    /// Loads session summary from file (called from background thread)
+    private static func loadSessionSummary(from url: URL) -> String? {
         guard let handle = FileHandle(forReadingAtPath: url.path) else { return nil }
         defer { try? handle.close() }
 
@@ -269,8 +273,6 @@ class RecentSessionsWatcher: ObservableObject {
         let fd = open(url.path, O_EVTONLY)
         guard fd >= 0 else { return }
 
-        fileDescriptors.append(fd)
-
         let queue = DispatchQueue(label: "com.claudesessionmonitor.recentwatcher.\(url.lastPathComponent)")
 
         let source = DispatchSource.makeFileSystemObjectSource(
@@ -281,7 +283,7 @@ class RecentSessionsWatcher: ObservableObject {
 
         source.setEventHandler { [weak self] in
             Task { @MainActor [weak self] in
-                self?.loadRecentSessions()
+                self?.triggerReload()
             }
         }
 
@@ -293,11 +295,6 @@ class RecentSessionsWatcher: ObservableObject {
         sources.append(source)
     }
 
-    func reset() {
-        hasInitialized = false
-        initialSessionIds.removeAll()
-        sessions.removeAll()
-    }
 }
 
 // MARK: - Project Directory Watcher
