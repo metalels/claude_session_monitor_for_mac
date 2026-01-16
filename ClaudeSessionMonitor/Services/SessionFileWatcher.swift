@@ -114,45 +114,67 @@ class SessionFileWatcher: ObservableObject {
 @MainActor
 class RecentSessionsWatcher: ObservableObject {
     private var sources: [DispatchSourceFileSystemObject] = []
+    private var sourcePathMap: [ObjectIdentifier: String] = [:]  // Map source to path for cleanup
+    private var monitoredPaths: Set<String> = []  // Track monitored directories
     private let parser = SessionParser()
     private var reloadTask: Task<Void, Never>?
+    private var ioTask: Task<([Session], Set<String>)?, Never>?
 
     @Published var sessions: [Session] = []
 
     func startWatching() {
         stopWatching()
+        // Start monitoring parent directory first (for detecting new projects)
+        startDirectoryMonitor(at: Constants.claudeProjectsPath)
+        // Then trigger reload which will also add monitors for existing projects
         triggerReload()
-        startAllProjectsMonitoring()
     }
 
     func stopWatching() {
         reloadTask?.cancel()
         reloadTask = nil
+        ioTask?.cancel()
+        ioTask = nil
 
         for source in sources {
             source.cancel()
         }
         sources.removeAll()
+        sourcePathMap.removeAll()
+        monitoredPaths.removeAll()
         // Note: FDs are closed by setCancelHandler, no manual close needed
     }
 
     /// Triggers background reload of recent sessions with debounce
-    /// Cancels any pending reload and starts a new one after 0.5 second delay
+    /// Also checks for new/removed project directories to update monitors
     private func triggerReload() {
         reloadTask?.cancel()
+        ioTask?.cancel()
         reloadTask = Task { [weak self] in
             // Debounce: wait 0.5 seconds before loading
             try? await Task.sleep(nanoseconds: 500_000_000)
             guard !Task.isCancelled else { return }
 
-            // Run I/O in background
-            let loadedSessions = await Task.detached {
-                await Self.loadRecentSessionsInBackground()
-            }.value
+            // Run I/O in detached task (off MainActor) for better performance
+            let detachedTask = Task.detached {
+                await Self.loadRecentSessionsAndProjectPaths()
+            }
+            self?.ioTask = detachedTask
+
+            // Use withTaskCancellationHandler to cancel detached task when parent is cancelled
+            let result = await withTaskCancellationHandler {
+                await detachedTask.value
+            } onCancel: {
+                detachedTask.cancel()
+            }
 
             guard !Task.isCancelled else { return }
-            // Already on MainActor since this Task inherits actor context
-            self?.updateSessions(loadedSessions)
+
+            // Only update if we got valid results (nil means error - keep existing data)
+            if let (loadedSessions, currentProjectPaths) = result {
+                self?.updateSessions(loadedSessions)
+                self?.syncMonitors(currentPaths: currentProjectPaths)
+            }
         }
     }
 
@@ -161,17 +183,55 @@ class RecentSessionsWatcher: ObservableObject {
         sessions = newSessions
     }
 
-    /// Loads recent sessions in background thread (non-blocking)
+    /// Sync monitors with current project directories
+    /// Add monitors for new projects, remove monitors for deleted projects
+    @MainActor
+    private func syncMonitors(currentPaths: Set<String>) {
+        // Add monitors for new projects
+        let newPaths = currentPaths.subtracting(monitoredPaths)
+        for path in newPaths {
+            let url = URL(fileURLWithPath: path)
+            startDirectoryMonitor(at: url)
+        }
+
+        // Remove monitors for deleted projects (but keep parent directory monitor)
+        let parentPath = Constants.claudeProjectsPath.path
+        let removedPaths = monitoredPaths.subtracting(currentPaths).subtracting([parentPath])
+        for path in removedPaths {
+            removeMonitor(forPath: path)
+        }
+    }
+
+    /// Remove monitor for a specific path
+    @MainActor
+    private func removeMonitor(forPath path: String) {
+        // Find and cancel the source for this path
+        for (index, source) in sources.enumerated().reversed() {
+            let sourceId = ObjectIdentifier(source)
+            if sourcePathMap[sourceId] == path {
+                source.cancel()
+                sources.remove(at: index)
+                sourcePathMap.removeValue(forKey: sourceId)
+                monitoredPaths.remove(path)
+                break
+            }
+        }
+    }
+
+    /// Loads recent sessions and returns project paths for monitoring
+    /// Returns nil on critical error (caller should keep existing data)
     /// First collects all session metadata, sorts by date, then loads summaries for top 10 only
-    private static func loadRecentSessionsInBackground() async -> [Session] {
+    private static func loadRecentSessionsAndProjectPaths() async -> ([Session], Set<String>)? {
         let projectsPath = Constants.claudeProjectsPath
 
         guard FileManager.default.fileExists(atPath: projectsPath.path) else {
-            return []
+            return ([], [])
         }
 
+        // Get project directories
+        let projectDirs: [URL]
         do {
-            let projectDirs = try FileManager.default.contentsOfDirectory(
+            projectDirs = try FileManager.default.contentsOfDirectory(
                 at: projectsPath,
                 includingPropertiesForKeys: [.isDirectoryKey],
                 options: [.skipsHiddenFiles]
@@ -180,50 +240,84 @@ class RecentSessionsWatcher: ObservableObject {
                 FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory)
                 return isDirectory.boolValue
             }
+        } catch {
+            // Critical error reading parent directory - return nil to keep existing data
+            print("Error reading projects directory: \(error)")
+            return nil
+        }
 
-            // First pass: collect all sessions without loading summaries
-            var allSessions: [Session] = []
+        // Collect project paths for monitoring
+        let projectPaths = Set(projectDirs.map { $0.path })
 
-            for projectDir in projectDirs {
-                let projectId = projectDir.lastPathComponent
+        // First pass: collect only top 10 sessions using streaming selection
+        // This avoids O(n log n) sort and reduces memory usage
+        // Handle per-project errors gracefully (continue with other projects)
+        var topSessions: [Session] = []
+        topSessions.reserveCapacity(10)
+
+        for projectDir in projectDirs {
+            // Check for cancellation to abort early on frequent events
+            guard !Task.isCancelled else { return nil }
+
+            let projectId = projectDir.lastPathComponent
+            do {
                 let jsonlFiles = try FileManager.default.contentsOfDirectory(
                     at: projectDir,
-                    includingPropertiesForKeys: [.contentModificationDateKey],
+                    includingPropertiesForKeys: nil,
                     options: [.skipsHiddenFiles]
                 ).filter { $0.pathExtension == "jsonl" }
 
                 for file in jsonlFiles {
+                    // Check for cancellation in inner loop for better responsiveness
+                    guard !Task.isCancelled else { return nil }
+
                     let session = Session(filePath: file, projectId: projectId)
-                    allSessions.append(session)
+
+                    // Streaming top-10 selection: insert if qualifies
+                    if topSessions.count < 10 {
+                        // List not full yet - insert in sorted order
+                        let insertIndex = topSessions.firstIndex { $0.lastModified < session.lastModified } ?? topSessions.count
+                        topSessions.insert(session, at: insertIndex)
+                    } else if session.lastModified > topSessions.last!.lastModified {
+                        // Session is newer than the oldest in top 10 - insert and remove oldest
+                        let insertIndex = topSessions.firstIndex { $0.lastModified < session.lastModified } ?? topSessions.count
+                        topSessions.insert(session, at: insertIndex)
+                        topSessions.removeLast()
+                    }
                 }
+            } catch {
+                // Per-project error - skip this project but continue with others
+                print("Error reading project \(projectId): \(error)")
+                continue
             }
-
-            // Sort by last modified and take top 10
-            let sortedSessions = allSessions.sorted { $0.lastModified > $1.lastModified }
-            var topSessions = Array(sortedSessions.prefix(10))
-
-            // Second pass: load summaries only for top 10 sessions
-            for index in topSessions.indices {
-                if let summary = loadSessionSummary(from: topSessions[index].filePath) {
-                    topSessions[index].summary = summary
-                }
-            }
-
-            return topSessions
-
-        } catch {
-            print("Error loading recent sessions: \(error)")
-            return []
         }
+
+        // Check for cancellation before loading summaries
+        guard !Task.isCancelled else { return nil }
+
+        // Second pass: load summaries only for top 10 sessions
+        for index in topSessions.indices {
+            // Check for cancellation before each summary load
+            guard !Task.isCancelled else { return nil }
+
+            if let summary = loadSessionSummary(from: topSessions[index].filePath) {
+                topSessions[index].summary = summary
+            }
+        }
+
+        return (topSessions, projectPaths)
     }
 
     /// Loads session summary from file (called from background thread)
+    /// Uses String(decoding:as:) to handle UTF-8 boundary issues gracefully
     private static func loadSessionSummary(from url: URL) -> String? {
         guard let handle = FileHandle(forReadingAtPath: url.path) else { return nil }
         defer { try? handle.close() }
 
         let data = handle.readData(ofLength: 4096)
-        guard let content = String(data: data, encoding: .utf8) else { return nil }
+        // Use String(decoding:as:) to handle incomplete UTF-8 sequences gracefully
+        // (replaces invalid bytes with replacement character instead of returning nil)
+        let content = String(decoding: data, as: UTF8.self)
 
         let lines = content.components(separatedBy: .newlines)
 
@@ -241,37 +335,14 @@ class RecentSessionsWatcher: ObservableObject {
         return nil
     }
 
-    private func startAllProjectsMonitoring() {
-        let projectsPath = Constants.claudeProjectsPath
-
-        guard FileManager.default.fileExists(atPath: projectsPath.path) else { return }
-
-        do {
-            let projectDirs = try FileManager.default.contentsOfDirectory(
-                at: projectsPath,
-                includingPropertiesForKeys: [.isDirectoryKey],
-                options: [.skipsHiddenFiles]
-            ).filter { url in
-                var isDirectory: ObjCBool = false
-                FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory)
-                return isDirectory.boolValue
-            }
-
-            for projectDir in projectDirs {
-                startDirectoryMonitor(at: projectDir)
-            }
-
-            // Also watch the main projects directory for new projects
-            startDirectoryMonitor(at: projectsPath)
-
-        } catch {
-            print("Error setting up project monitoring: \(error)")
-        }
-    }
-
     private func startDirectoryMonitor(at url: URL) {
+        // Skip if already monitoring this path
+        guard !monitoredPaths.contains(url.path) else { return }
+
         let fd = open(url.path, O_EVTONLY)
         guard fd >= 0 else { return }
+
+        monitoredPaths.insert(url.path)
 
         let queue = DispatchQueue(label: "com.claudesessionmonitor.recentwatcher.\(url.lastPathComponent)")
 
@@ -293,6 +364,7 @@ class RecentSessionsWatcher: ObservableObject {
 
         source.resume()
         sources.append(source)
+        sourcePathMap[ObjectIdentifier(source)] = url.path
     }
 
 }

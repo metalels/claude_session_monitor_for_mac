@@ -78,6 +78,8 @@ struct SessionRowView: View {
     let session: Session
     let isSelected: Bool
 
+    @State private var showCopiedFeedback = false
+
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
             // Date and time
@@ -85,6 +87,15 @@ struct SessionRowView: View {
                 Text(dateString)
                     .font(.system(.caption, design: .monospaced))
                     .foregroundColor(isSelected ? .white.opacity(0.8) : .secondary)
+
+                // Copy path button
+                Button(action: copyFilePath) {
+                    Image(systemName: showCopiedFeedback ? "checkmark" : "doc.on.doc")
+                        .font(.system(size: 10))
+                        .foregroundColor(showCopiedFeedback ? .green : (isSelected ? .white.opacity(0.7) : .secondary))
+                }
+                .buttonStyle(.plain)
+                .help("Copy session file path")
 
                 Spacer()
 
@@ -121,6 +132,24 @@ struct SessionRowView: View {
         let formatter = DateFormatter()
         formatter.dateFormat = "MM/dd HH:mm"
         return formatter.string(from: session.lastModified)
+    }
+
+    private func copyFilePath() {
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        pasteboard.setString(session.filePath.path, forType: .string)
+
+        // Show feedback
+        withAnimation {
+            showCopiedFeedback = true
+        }
+
+        // Reset after delay
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+            withAnimation {
+                showCopiedFeedback = false
+            }
+        }
     }
 }
 

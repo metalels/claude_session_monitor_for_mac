@@ -319,6 +319,10 @@ struct MessageTableView: View {
                 .listRowInsets(EdgeInsets(top: 4, leading: 8, bottom: 4, trailing: 8))
             }
             .listStyle(.plain)
+            .safeAreaInset(edge: .bottom, spacing: 0) {
+                // 5行分程度の空白エリアを追加してスクロールしやすくする
+                Color.clear.frame(height: 120)
+            }
             .onAppear {
                 // Scroll to last message when session is opened
                 if let lastMessage = messages.last {
